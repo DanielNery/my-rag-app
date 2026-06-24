@@ -324,7 +324,11 @@ jobs:
                 --cluster "$ECS_CLUSTER" \
                 --service "$ECS_SERVICE" \
                 --region "$AWS_REGION"
-              sleep 15
+              echo "Waiting for service to become inactive..."
+              aws ecs wait services-inactive \
+                --cluster "$ECS_CLUSTER" \
+                --services "$ECS_SERVICE" \
+                --region "$AWS_REGION"
               SERVICE_STATUS="MISSING"
             else
               echo "Updating task definition on existing service..."
