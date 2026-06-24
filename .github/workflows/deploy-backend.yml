@@ -136,7 +136,7 @@ jobs:
           if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
             SG_ID=$(aws ec2 create-security-group \
               --group-name "$SG_NAME" \
-              --description "Pipefy backend — port 8000" \
+              --description "Pipefy backend - port 8000" \
               --vpc-id "$VPC_ID" \
               --region "$AWS_REGION" \
               --query "GroupId" \
