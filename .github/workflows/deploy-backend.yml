@@ -104,56 +104,143 @@ jobs:
           echo "role_arn=$ROLE_ARN" >> "$GITHUB_OUTPUT"
 
       # ── Networking ────────────────────────────────────────────────────────
-      - name: Resolve default VPC, subnet, and security group
+      - name: Resolve VPC, subnets, and security groups
         id: network
         run: |
-          # Default VPC
           VPC_ID=$(aws ec2 describe-vpcs \
             --filters "Name=isDefault,Values=true" \
             --query "Vpcs[0].VpcId" \
-            --output text \
-            --region "$AWS_REGION")
+            --output text --region "$AWS_REGION")
+          echo "VPC: $VPC_ID"
 
-          echo "Using VPC: $VPC_ID"
-
-          # First available subnet in default VPC
-          SUBNET_ID=$(aws ec2 describe-subnets \
+          # Two subnets in different AZs — ALB requires multi-AZ
+          SUBNETS=$(aws ec2 describe-subnets \
             --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query "Subnets[0].SubnetId" \
-            --output text \
-            --region "$AWS_REGION")
+            --query "Subnets[0:2].SubnetId" \
+            --output text --region "$AWS_REGION")
+          SUBNET_1=$(echo "$SUBNETS" | awk '{print $1}')
+          SUBNET_2=$(echo "$SUBNETS" | awk '{print $2}')
+          echo "Subnets: $SUBNET_1 $SUBNET_2"
 
-          echo "Using subnet: $SUBNET_ID"
-
-          # Security group — create once, reuse on subsequent runs
-          SG_NAME="pipefy-backend-sg"
-          SG_ID=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$VPC_ID" \
+          # ALB security group — port 80 public
+          ALB_SG_NAME="pipefy-alb-sg"
+          ALB_SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=$ALB_SG_NAME" "Name=vpc-id,Values=$VPC_ID" \
             --query "SecurityGroups[0].GroupId" \
-            --output text \
-            --region "$AWS_REGION" 2>/dev/null) || true
+            --output text --region "$AWS_REGION" 2>/dev/null) || true
 
-          if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
-            SG_ID=$(aws ec2 create-security-group \
-              --group-name "$SG_NAME" \
-              --description "Pipefy backend - port 8000" \
-              --vpc-id "$VPC_ID" \
-              --region "$AWS_REGION" \
-              --query "GroupId" \
-              --output text)
-
+          if [ -z "$ALB_SG_ID" ] || [ "$ALB_SG_ID" = "None" ]; then
+            ALB_SG_ID=$(aws ec2 create-security-group \
+              --group-name "$ALB_SG_NAME" \
+              --description "Pipefy ALB - port 80" \
+              --vpc-id "$VPC_ID" --region "$AWS_REGION" \
+              --query "GroupId" --output text)
             aws ec2 authorize-security-group-ingress \
-              --group-id "$SG_ID" \
-              --protocol tcp \
-              --port 8000 \
-              --cidr 0.0.0.0/0 \
+              --group-id "$ALB_SG_ID" \
+              --protocol tcp --port 80 --cidr 0.0.0.0/0 \
+              --region "$AWS_REGION"
+          fi
+          echo "ALB SG: $ALB_SG_ID"
+
+          # ECS task security group — port 8000
+          ECS_SG_NAME="pipefy-backend-sg"
+          ECS_SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=$ECS_SG_NAME" "Name=vpc-id,Values=$VPC_ID" \
+            --query "SecurityGroups[0].GroupId" \
+            --output text --region "$AWS_REGION" 2>/dev/null) || true
+
+          if [ -z "$ECS_SG_ID" ] || [ "$ECS_SG_ID" = "None" ]; then
+            ECS_SG_ID=$(aws ec2 create-security-group \
+              --group-name "$ECS_SG_NAME" \
+              --description "Pipefy backend - port 8000" \
+              --vpc-id "$VPC_ID" --region "$AWS_REGION" \
+              --query "GroupId" --output text)
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$ECS_SG_ID" \
+              --protocol tcp --port 8000 --cidr 0.0.0.0/0 \
+              --region "$AWS_REGION"
+          fi
+          echo "ECS SG: $ECS_SG_ID"
+
+          echo "vpc_id=$VPC_ID"        >> "$GITHUB_OUTPUT"
+          echo "subnet_1=$SUBNET_1"    >> "$GITHUB_OUTPUT"
+          echo "subnet_2=$SUBNET_2"    >> "$GITHUB_OUTPUT"
+          echo "alb_sg_id=$ALB_SG_ID" >> "$GITHUB_OUTPUT"
+          echo "ecs_sg_id=$ECS_SG_ID" >> "$GITHUB_OUTPUT"
+
+      # ── ALB + Target Group + Listener ─────────────────────────────────────
+      - name: Create ALB, target group, and listener (if not exists)
+        id: alb
+        env:
+          VPC_ID: ${{ steps.network.outputs.vpc_id }}
+          SUBNET_1: ${{ steps.network.outputs.subnet_1 }}
+          SUBNET_2: ${{ steps.network.outputs.subnet_2 }}
+          ALB_SG_ID: ${{ steps.network.outputs.alb_sg_id }}
+        run: |
+          TG_NAME="pipefy-backend-tg"
+          ALB_NAME="pipefy-backend-alb"
+
+          # Target Group
+          TG_ARN=$(aws elbv2 describe-target-groups \
+            --names "$TG_NAME" \
+            --query "TargetGroups[0].TargetGroupArn" \
+            --output text --region "$AWS_REGION" 2>/dev/null) || true
+
+          if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then
+            TG_ARN=$(aws elbv2 create-target-group \
+              --name "$TG_NAME" \
+              --protocol HTTP --port 8000 \
+              --vpc-id "$VPC_ID" \
+              --target-type ip \
+              --health-check-path "/health" \
+              --health-check-interval-seconds 30 \
+              --healthy-threshold-count 2 \
+              --unhealthy-threshold-count 3 \
+              --query "TargetGroups[0].TargetGroupArn" \
+              --output text --region "$AWS_REGION")
+          fi
+          echo "Target Group: $TG_ARN"
+
+          # Application Load Balancer
+          ALB_ARN=$(aws elbv2 describe-load-balancers \
+            --names "$ALB_NAME" \
+            --query "LoadBalancers[0].LoadBalancerArn" \
+            --output text --region "$AWS_REGION" 2>/dev/null) || true
+
+          if [ -z "$ALB_ARN" ] || [ "$ALB_ARN" = "None" ]; then
+            ALB_ARN=$(aws elbv2 create-load-balancer \
+              --name "$ALB_NAME" \
+              --subnets "$SUBNET_1" "$SUBNET_2" \
+              --security-groups "$ALB_SG_ID" \
+              --scheme internet-facing \
+              --type application \
+              --query "LoadBalancers[0].LoadBalancerArn" \
+              --output text --region "$AWS_REGION")
+          fi
+
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --load-balancer-arns "$ALB_ARN" \
+            --query "LoadBalancers[0].DNSName" \
+            --output text --region "$AWS_REGION")
+          echo "ALB DNS: $ALB_DNS"
+
+          # HTTP Listener
+          LISTENER_ARN=$(aws elbv2 describe-listeners \
+            --load-balancer-arn "$ALB_ARN" \
+            --query "Listeners[0].ListenerArn" \
+            --output text --region "$AWS_REGION" 2>/dev/null) || true
+
+          if [ -z "$LISTENER_ARN" ] || [ "$LISTENER_ARN" = "None" ]; then
+            aws elbv2 create-listener \
+              --load-balancer-arn "$ALB_ARN" \
+              --protocol HTTP --port 80 \
+              --default-actions "Type=forward,TargetGroupArn=$TG_ARN" \
               --region "$AWS_REGION"
           fi
 
-          echo "Using security group: $SG_ID"
-
-          echo "subnet_id=$SUBNET_ID"    >> "$GITHUB_OUTPUT"
-          echo "sg_id=$SG_ID"           >> "$GITHUB_OUTPUT"
+          echo "tg_arn=$TG_ARN"   >> "$GITHUB_OUTPUT"
+          echo "alb_arn=$ALB_ARN" >> "$GITHUB_OUTPUT"
+          echo "alb_dns=$ALB_DNS" >> "$GITHUB_OUTPUT"
 
       # ── Task Definition ───────────────────────────────────────────────────
       - name: Register ECS task definition
@@ -205,8 +292,10 @@ jobs:
       - name: Create or update ECS service
         env:
           TASK_DEF_ARN: ${{ steps.task-def.outputs.task_def_arn }}
-          SUBNET_ID: ${{ steps.network.outputs.subnet_id }}
-          SG_ID: ${{ steps.network.outputs.sg_id }}
+          TG_ARN: ${{ steps.alb.outputs.tg_arn }}
+          SUBNET_1: ${{ steps.network.outputs.subnet_1 }}
+          SUBNET_2: ${{ steps.network.outputs.subnet_2 }}
+          ECS_SG_ID: ${{ steps.network.outputs.ecs_sg_id }}
         run: |
           SERVICE_STATUS=$(aws ecs describe-services \
             --cluster "$ECS_CLUSTER" \
@@ -216,15 +305,40 @@ jobs:
             --output text 2>/dev/null) || true
 
           if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
-            echo "Updating existing service..."
-            aws ecs update-service \
+            # Check if the service already has an ALB attached
+            HAS_LB=$(aws ecs describe-services \
               --cluster "$ECS_CLUSTER" \
-              --service "$ECS_SERVICE" \
-              --task-definition "$TASK_DEF_ARN" \
-              --force-new-deployment \
-              --region "$AWS_REGION"
-          else
-            echo "Creating new service..."
+              --services "$ECS_SERVICE" \
+              --region "$AWS_REGION" \
+              --query "length(services[0].loadBalancers)" \
+              --output text 2>/dev/null) || true
+
+            if [ "$HAS_LB" = "0" ] || [ -z "$HAS_LB" ]; then
+              echo "Existing service has no ALB — recreating with ALB..."
+              aws ecs update-service \
+                --cluster "$ECS_CLUSTER" \
+                --service "$ECS_SERVICE" \
+                --desired-count 0 \
+                --region "$AWS_REGION"
+              aws ecs delete-service \
+                --cluster "$ECS_CLUSTER" \
+                --service "$ECS_SERVICE" \
+                --region "$AWS_REGION"
+              sleep 15
+              SERVICE_STATUS="MISSING"
+            else
+              echo "Updating task definition on existing service..."
+              aws ecs update-service \
+                --cluster "$ECS_CLUSTER" \
+                --service "$ECS_SERVICE" \
+                --task-definition "$TASK_DEF_ARN" \
+                --force-new-deployment \
+                --region "$AWS_REGION"
+            fi
+          fi
+
+          if [ "$SERVICE_STATUS" != "ACTIVE" ]; then
+            echo "Creating service with ALB..."
             aws ecs create-service \
               --cluster "$ECS_CLUSTER" \
               --service-name "$ECS_SERVICE" \
@@ -232,24 +346,101 @@ jobs:
               --desired-count 1 \
               --launch-type FARGATE \
               --network-configuration "awsvpcConfiguration={
-                subnets=[$SUBNET_ID],
-                securityGroups=[$SG_ID],
+                subnets=[$SUBNET_1,$SUBNET_2],
+                securityGroups=[$ECS_SG_ID],
                 assignPublicIp=ENABLED
               }" \
+              --load-balancers "targetGroupArn=$TG_ARN,containerName=$CONTAINER_NAME,containerPort=8000" \
               --region "$AWS_REGION"
           fi
+
+      # ── CloudFront (HTTPS) ────────────────────────────────────────────────
+      - name: Create CloudFront distribution (if not exists)
+        id: cloudfront
+        env:
+          ALB_DNS: ${{ steps.alb.outputs.alb_dns }}
+        run: |
+          CF_COMMENT="pipefy-backend-cf"
+
+          # Check if distribution already exists by Comment field
+          DIST_ID=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Comment=='$CF_COMMENT'].Id" \
+            --output text 2>/dev/null) || true
+
+          if [ -z "$DIST_ID" ] || [ "$DIST_ID" = "None" ]; then
+            echo "Creating CloudFront distribution..."
+
+            # Write config to a temp file to safely interpolate ALB_DNS
+            cat > /tmp/cf-config.json << CFEOF
+          {
+            "CallerReference": "pipefy-backend-cf-v1",
+            "Comment": "pipefy-backend-cf",
+            "Origins": {
+              "Quantity": 1,
+              "Items": [{
+                "Id": "ALB",
+                "DomainName": "${ALB_DNS}",
+                "CustomOriginConfig": {
+                  "HTTPPort": 80,
+                  "HTTPSPort": 443,
+                  "OriginProtocolPolicy": "http-only"
+                }
+              }]
+            },
+            "DefaultCacheBehavior": {
+              "TargetOriginId": "ALB",
+              "ViewerProtocolPolicy": "redirect-to-https",
+              "AllowedMethods": {
+                "Quantity": 7,
+                "Items": ["DELETE","GET","HEAD","OPTIONS","PATCH","POST","PUT"],
+                "CachedMethods": {"Quantity": 2, "Items": ["GET","HEAD"]}
+              },
+              "ForwardedValues": {
+                "QueryString": true,
+                "Cookies": {"Forward": "all"},
+                "Headers": {"Quantity": 1, "Items": ["*"]}
+              },
+              "MinTTL": 0,
+              "DefaultTTL": 0,
+              "MaxTTL": 0,
+              "Compress": true
+            },
+            "Enabled": true
+          }
+          CFEOF
+
+            DIST_DOMAIN=$(aws cloudfront create-distribution \
+              --distribution-config file:///tmp/cf-config.json \
+              --query "Distribution.DomainName" \
+              --output text)
+          else
+            echo "Reusing existing CloudFront distribution: $DIST_ID"
+            DIST_DOMAIN=$(aws cloudfront get-distribution \
+              --id "$DIST_ID" \
+              --query "Distribution.DomainName" \
+              --output text)
+          fi
+
+          echo "CloudFront HTTPS URL: https://$DIST_DOMAIN"
+          echo "cf_domain=$DIST_DOMAIN" >> "$GITHUB_OUTPUT"
 
       # ── Summary ───────────────────────────────────────────────────────────
       - name: Print deployment summary
         env:
           IMAGE: ${{ steps.build-image.outputs.image }}
           TASK_DEF_ARN: ${{ steps.task-def.outputs.task_def_arn }}
+          ALB_DNS: ${{ steps.alb.outputs.alb_dns }}
+          CF_DOMAIN: ${{ steps.cloudfront.outputs.cf_domain }}
         run: |
           echo "### Deploy concluido" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Campo           | Valor |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-----------------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Cluster         | \`$ECS_CLUSTER\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Service         | \`$ECS_SERVICE\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Task Definition | \`$TASK_DEF_ARN\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Image           | \`$IMAGE\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Campo             | Valor |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------------------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Cluster           | \`$ECS_CLUSTER\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Service           | \`$ECS_SERVICE\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Task Definition   | \`$TASK_DEF_ARN\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image             | \`$IMAGE\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ALB               | \`http://$ALB_DNS\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Backend HTTPS** | \`https://$CF_DOMAIN\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "> Atualize \`VITE_API_URL\` no Amplify para: \`https://$CF_DOMAIN\`" >> "$GITHUB_STEP_SUMMARY"
