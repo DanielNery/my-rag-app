@@ -1,0 +1,255 @@
+name: Deploy Backend to ECS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - ".github/workflows/deploy-backend.yml"
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: pipefy-backend
+  ECS_CLUSTER: pipefy-cluster
+  ECS_SERVICE: pipefy-backend-service
+  CONTAINER_NAME: pipefy-backend
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── AWS credentials ───────────────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── ECR ───────────────────────────────────────────────────────────────
+      - name: Create ECR repository (if not exists)
+        run: |
+          aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --region "$AWS_REGION" 2>/dev/null \
+          || aws ecr create-repository \
+            --repository-name "$ECR_REPOSITORY" \
+            --region "$AWS_REGION"
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Docker build & push ───────────────────────────────────────────────
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" ./backend
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      # ── ECS Cluster ───────────────────────────────────────────────────────
+      - name: Create ECS cluster (if not exists)
+        run: |
+          aws ecs create-cluster \
+            --cluster-name "$ECS_CLUSTER" \
+            --region "$AWS_REGION" 2>/dev/null || true
+
+      # ── CloudWatch Logs ───────────────────────────────────────────────────
+      - name: Create CloudWatch log group (if not exists)
+        run: |
+          aws logs create-log-group \
+            --log-group-name "/ecs/pipefy-backend" \
+            --region "$AWS_REGION" 2>/dev/null || true
+
+      # ── IAM execution role ────────────────────────────────────────────────
+      - name: Create ECS task execution role (if not exists)
+        id: iam-role
+        run: |
+          ROLE_NAME="ecsTaskExecutionRole"
+
+          ROLE_ARN=$(aws iam get-role \
+            --role-name "$ROLE_NAME" \
+            --query "Role.Arn" \
+            --output text 2>/dev/null) || true
+
+          if [ -z "$ROLE_ARN" ] || [ "$ROLE_ARN" = "None" ]; then
+            ROLE_ARN=$(aws iam create-role \
+              --role-name "$ROLE_NAME" \
+              --assume-role-policy-document '{
+                "Version":"2012-10-17",
+                "Statement":[{
+                  "Effect":"Allow",
+                  "Principal":{"Service":"ecs-tasks.amazonaws.com"},
+                  "Action":"sts:AssumeRole"
+                }]
+              }' \
+              --query "Role.Arn" \
+              --output text)
+
+            aws iam attach-role-policy \
+              --role-name "$ROLE_NAME" \
+              --policy-arn "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+          fi
+
+          echo "role_arn=$ROLE_ARN" >> "$GITHUB_OUTPUT"
+
+      # ── Networking ────────────────────────────────────────────────────────
+      - name: Resolve default VPC, subnet, and security group
+        id: network
+        run: |
+          # Default VPC
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=isDefault,Values=true" \
+            --query "Vpcs[0].VpcId" \
+            --output text \
+            --region "$AWS_REGION")
+
+          echo "Using VPC: $VPC_ID"
+
+          # First available subnet in default VPC
+          SUBNET_ID=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query "Subnets[0].SubnetId" \
+            --output text \
+            --region "$AWS_REGION")
+
+          echo "Using subnet: $SUBNET_ID"
+
+          # Security group — create once, reuse on subsequent runs
+          SG_NAME="pipefy-backend-sg"
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$VPC_ID" \
+            --query "SecurityGroups[0].GroupId" \
+            --output text \
+            --region "$AWS_REGION" 2>/dev/null) || true
+
+          if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name "$SG_NAME" \
+              --description "Pipefy backend — port 8000" \
+              --vpc-id "$VPC_ID" \
+              --region "$AWS_REGION" \
+              --query "GroupId" \
+              --output text)
+
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$SG_ID" \
+              --protocol tcp \
+              --port 8000 \
+              --cidr 0.0.0.0/0 \
+              --region "$AWS_REGION"
+          fi
+
+          echo "Using security group: $SG_ID"
+
+          echo "subnet_id=$SUBNET_ID"    >> "$GITHUB_OUTPUT"
+          echo "sg_id=$SG_ID"           >> "$GITHUB_OUTPUT"
+
+      # ── Task Definition ───────────────────────────────────────────────────
+      - name: Register ECS task definition
+        id: task-def
+        env:
+          IMAGE: ${{ steps.build-image.outputs.image }}
+          EXECUTION_ROLE_ARN: ${{ steps.iam-role.outputs.role_arn }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --family "pipefy-backend" \
+            --network-mode awsvpc \
+            --requires-compatibilities FARGATE \
+            --cpu "256" \
+            --memory "512" \
+            --execution-role-arn "$EXECUTION_ROLE_ARN" \
+            --region "$AWS_REGION" \
+            --container-definitions "[
+              {
+                \"name\": \"$CONTAINER_NAME\",
+                \"image\": \"$IMAGE\",
+                \"essential\": true,
+                \"portMappings\": [
+                  { \"containerPort\": 8000, \"protocol\": \"tcp\" }
+                ],
+                \"environment\": [
+                  { \"name\": \"OPENAI_API_KEY\",           \"value\": \"$OPENAI_API_KEY\" },
+                  { \"name\": \"REDIS_URL\",                \"value\": \"$REDIS_URL\" },
+                  { \"name\": \"OPENAI_MODEL\",             \"value\": \"gpt-5.4-mini\" },
+                  { \"name\": \"OPENAI_EMBEDDING_MODEL\",   \"value\": \"text-embedding-3-small\" }
+                ],
+                \"logConfiguration\": {
+                  \"logDriver\": \"awslogs\",
+                  \"options\": {
+                    \"awslogs-group\":         \"/ecs/pipefy-backend\",
+                    \"awslogs-region\":        \"$AWS_REGION\",
+                    \"awslogs-stream-prefix\": \"ecs\"
+                  }
+                }
+              }
+            ]" \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          echo "task_def_arn=$TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
+
+      # ── ECS Service ───────────────────────────────────────────────────────
+      - name: Create or update ECS service
+        env:
+          TASK_DEF_ARN: ${{ steps.task-def.outputs.task_def_arn }}
+          SUBNET_ID: ${{ steps.network.outputs.subnet_id }}
+          SG_ID: ${{ steps.network.outputs.sg_id }}
+        run: |
+          SERVICE_STATUS=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --region "$AWS_REGION" \
+            --query "services[0].status" \
+            --output text 2>/dev/null) || true
+
+          if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
+            echo "Updating existing service..."
+            aws ecs update-service \
+              --cluster "$ECS_CLUSTER" \
+              --service "$ECS_SERVICE" \
+              --task-definition "$TASK_DEF_ARN" \
+              --force-new-deployment \
+              --region "$AWS_REGION"
+          else
+            echo "Creating new service..."
+            aws ecs create-service \
+              --cluster "$ECS_CLUSTER" \
+              --service-name "$ECS_SERVICE" \
+              --task-definition "$TASK_DEF_ARN" \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={
+                subnets=[$SUBNET_ID],
+                securityGroups=[$SG_ID],
+                assignPublicIp=ENABLED
+              }" \
+              --region "$AWS_REGION"
+          fi
+
+      # ── Summary ───────────────────────────────────────────────────────────
+      - name: Print deployment summary
+        env:
+          IMAGE: ${{ steps.build-image.outputs.image }}
+          TASK_DEF_ARN: ${{ steps.task-def.outputs.task_def_arn }}
+        run: |
+          echo "### Deploy concluido" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Campo           | Valor |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Cluster         | \`$ECS_CLUSTER\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Service         | \`$ECS_SERVICE\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Task Definition | \`$TASK_DEF_ARN\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image           | \`$IMAGE\` |" >> "$GITHUB_STEP_SUMMARY"
